@@ -20,7 +20,7 @@ from urllib3.exceptions import MaxRetryError
 
 SPAWN = 'spawn'
 BOT_DIRECTORY = Path(__file__).parent / 'bots'
-LIFESPAN = 15
+LIFESPAN = 20
 
 class MyActionBroker(BotActionBroker):
     def __init__(self, script):
@@ -79,6 +79,7 @@ class PokebotTrainer(BaseScript):
         self.available_bot_names.sort()
         self.logger.info(f"Pokebot trainer has: {self.available_bots.keys()}")
         self.setup_manager = SetupManager()
+        self.ready = False
 
     def heartbeat_connection_attempts_to_twitch_broker(self, port):
         register_api_config = Configuration()
@@ -107,6 +108,10 @@ class PokebotTrainer(BaseScript):
 
     def process_choice(self, choice: BotAction):
 
+        if not self.setup_manager.has_started:
+            self.logger.error(f"Tried to {choice.description} before the setup manager was fully started!")
+            return
+
         if choice.action_type == SPAWN:
             name = choice.data['name']
             team = choice.data['team']
@@ -119,7 +124,12 @@ class PokebotTrainer(BaseScript):
                 unique_name = f'{name[:27]} ({count})'  # Truncate at 27 because we can have up to '(10)' appended
                 count += 1
 
-            self.active_bots.append(ActiveBot(unique_name, team, randint(1, 65535), self.game_tick_packet.game_info.seconds_elapsed, bundle))
+            new_bot = ActiveBot(unique_name, team, randint(1, 2**31 - 1), self.game_tick_packet.game_info.seconds_elapsed, bundle)
+            try:
+                none_index = self.active_bots.index(None)
+                self.active_bots[none_index] = new_bot
+            except ValueError:
+                self.active_bots.append(new_bot)
             self.relaunch_bots()
 
     def relaunch_bots(self):
@@ -131,10 +141,9 @@ class PokebotTrainer(BaseScript):
         match_config.mutators = MutatorConfig()
 
         self.setup_manager.load_match_config(match_config)
-        self.setup_manager.launch_early_start_bot_processes()
-        self.setup_manager.try_recieve_agent_metadata()
         self.setup_manager.start_match()
         self.setup_manager.launch_bot_processes()
+        self.setup_manager.try_recieve_agent_metadata()
 
     def start(self):
         port = find_usable_port(9886)
@@ -144,6 +153,7 @@ class PokebotTrainer(BaseScript):
         Thread(target=self.heartbeat_connection_attempts_to_twitch_broker, args=(port,), daemon=True).start()
 
         self.setup_manager.connect_to_game()
+        self.ready = True
 
         while True:
             self.get_game_tick_packet()
