@@ -1,16 +1,16 @@
 from dataclasses import dataclass
+from pathlib import Path
 from random import randint
 from threading import Thread
 from time import sleep
 from typing import List, Dict
-from pathlib import Path
 
 from rlbot.agents.base_script import BaseScript
 from rlbot.matchconfig.match_config import MatchConfig, PlayerConfig, MutatorConfig, EmptyPlayerSlot
 from rlbot.parsing.bot_config_bundle import BotConfigBundle
 from rlbot.parsing.directory_scanner import scan_directory_for_bot_configs
 from rlbot.setup_manager import SetupManager
-from rlbot.utils.structures.game_data_struct import PlayerInfo
+from rlbot.utils.game_state_util import GameState, CarState
 from rlbot_action_server.bot_action_broker import BotActionBroker, run_action_server, find_usable_port
 from rlbot_action_server.bot_holder import set_bot_action_broker
 from rlbot_action_server.models import BotAction, AvailableActions, ActionChoice, ApiResponse
@@ -21,6 +21,7 @@ from urllib3.exceptions import MaxRetryError
 SPAWN = 'spawn'
 BOT_DIRECTORY = Path(__file__).parent / 'bots'
 LIFESPAN = 20
+GIVE_BOOST = True
 
 class MyActionBroker(BotActionBroker):
     def __init__(self, script):
@@ -72,7 +73,6 @@ class PokebotTrainer(BaseScript):
     def __init__(self):
         super().__init__("Pokebot Trainer")
         self.action_broker = MyActionBroker(self)
-        self.known_players: List[PlayerInfo] = []
         self.active_bots: List[ActiveBot] = []
         self.available_bots: Dict[str, BotConfigBundle] = {b.name: b for b in self.get_bots()}
         self.available_bot_names: List[str] = list(self.available_bots.keys())
@@ -80,6 +80,16 @@ class PokebotTrainer(BaseScript):
         self.logger.info(f"Pokebot trainer has: {self.available_bots.keys()}")
         self.setup_manager = SetupManager()
         self.ready = False
+        self.requested_relaunch: MatchConfig = None
+        self.bots_pending_post_spawn_processing: List[ActiveBot] = []
+
+    def index_from_spawn_id(self, spawn_id):
+        packet = self.game_tick_packet
+        for n in range(0, packet.num_cars):
+            packet_spawn_id = packet.game_cars[n].spawn_id
+            if spawn_id == packet_spawn_id:
+                return n
+        return None
 
     def heartbeat_connection_attempts_to_twitch_broker(self, port):
         register_api_config = Configuration()
@@ -130,20 +140,37 @@ class PokebotTrainer(BaseScript):
                 self.active_bots[none_index] = new_bot
             except ValueError:
                 self.active_bots.append(new_bot)
-            self.relaunch_bots()
+            self.bots_pending_post_spawn_processing.append(new_bot)
+            self.set_pending_relaunch_config(self.active_bots)
 
-    def relaunch_bots(self):
+    def set_pending_relaunch_config(self, active_bots: List[ActiveBot]):
         match_config = MatchConfig()
-        match_config.player_configs = [player_config_from_active_bot(ab) for ab in self.active_bots]
+        match_config.player_configs = [player_config_from_active_bot(ab) for ab in active_bots]
         match_config.game_mode = 'Soccer'
         match_config.game_map = 'DFHStadium'
         match_config.existing_match_behavior = 'Continue And Spawn'
         match_config.mutators = MutatorConfig()
+        self.requested_relaunch = match_config
 
+    def execute_relaunch(self):
+        match_config = self.requested_relaunch
+        if match_config is None:
+            return
+        self.requested_relaunch = None
         self.setup_manager.load_match_config(match_config)
         self.setup_manager.start_match()
-        self.setup_manager.launch_bot_processes()
+        self.setup_manager.launch_bot_processes(match_config=match_config)
         self.setup_manager.try_recieve_agent_metadata()
+        self.logger.info("Done relaunching bots")
+        if GIVE_BOOST:
+            car_states = {}
+            self.get_game_tick_packet()
+            for bot in self.bots_pending_post_spawn_processing:
+                index = self.index_from_spawn_id(bot.spawn_id)
+                if index is not None:
+                    car_states[index] = CarState(boost_amount=100)
+            self.set_game_state(GameState(cars=car_states))
+        self.bots_pending_post_spawn_processing.clear()
 
     def start(self):
         port = find_usable_port(9886)
@@ -161,7 +188,7 @@ class PokebotTrainer(BaseScript):
             game_seconds = self.game_tick_packet.game_info.seconds_elapsed
 
             needs_relaunch = False
-            next_bots = []
+            next_bots: List[ActiveBot] = []
             for b in self.active_bots:
                 if b is not None and game_seconds > b.join_time + LIFESPAN:
                     next_bots.append(None)
@@ -173,7 +200,9 @@ class PokebotTrainer(BaseScript):
                 while len(next_bots) > 0 and next_bots[-1] is None:
                     next_bots.pop()  # Get rid of any trailing None values.
                 self.active_bots = next_bots
-                self.relaunch_bots()
+                self.set_pending_relaunch_config(next_bots)
+
+            self.execute_relaunch()
 
             sleep(0.1)
 
